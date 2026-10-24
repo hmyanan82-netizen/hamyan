@@ -72,7 +72,9 @@ module.exports = async function handler(req, res) {
 
   if (req.method === "OPTIONS") return res.status(200).end();
 
-  const segments = req.query.path || [];
+  const queryPath = Array.isArray(req.query.path) ? req.query.path : (typeof req.query.path === "string" ? req.query.path.split("/") : []);
+  const rawUrl = (req.url || "").split("?")[0].split("#")[0];
+  const segments = queryPath.length > 0 ? queryPath : rawUrl.replace(/^\/api\//, "").split("/").filter(Boolean);
   const urlPath = "/api/" + segments.join("/");
   const body = req.body || {};
   const isAdmin = req.headers["x-admin-password"] === ADMIN_PASSWORD;
