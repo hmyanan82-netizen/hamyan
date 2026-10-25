@@ -2,6 +2,7 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "fazaa2026";
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const TABLE = "orders";
+const ACTIVE_MS = 15000;
 
 const str = (v, max = 300) => String(v == null ? "" : v).slice(0, max);
 
@@ -167,11 +168,19 @@ module.exports = async function handler(req, res) {
 
     // POST /api/ping
     if (req.method === "POST" && urlPath === "/api/ping") {
+      const id = str(body.id, 40);
+      if (id) {
+        await supaRest("POST", "visitors", { id, page: str(body.page, 60), last_ping: Date.now() });
+      }
       return res.status(200).json({ ok: true });
     }
 
     // POST /api/leave
     if (req.method === "POST" && urlPath === "/api/leave") {
+      const id = str(body.id, 40);
+      if (id) {
+        await supaRest("DELETE", `visitors?id=eq.${encodeURIComponent(id)}`);
+      }
       return res.status(200).json({ ok: true });
     }
 
@@ -185,7 +194,11 @@ module.exports = async function handler(req, res) {
 
       if (req.method === "GET" && urlPath === "/api/admin/orders") {
         const orders = await loadOrders();
-        return res.status(200).json({ ok: true, orders, active: 0, pages: [] });
+        const cutoff = Date.now() - ACTIVE_MS;
+        const allVisitors = await supaRest("GET", `visitors?last_ping=gte.${cutoff}`);
+        const active = allVisitors ? allVisitors.length : 0;
+        const pages = allVisitors ? allVisitors.map(v => v.page) : [];
+        return res.status(200).json({ ok: true, orders, active, pages });
       }
 
       if (req.method === "POST" && segments[1] === "decide" && segments[2]) {
